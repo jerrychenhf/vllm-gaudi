@@ -3185,6 +3185,9 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
                     if spec_decode_metadata is None:
                         decode_sampled_token_ids.append(sampler_output.sampled_token_ids.flatten())
+                        decode_sampled_token_ids_device = \
+                            sampler_output.sampled_token_ids.to(
+                                "hpu", non_blocking=True)
                     else:
                         # Handling spec decode sampling.
                         sampler_output = self.rejection_sampler(
@@ -4490,14 +4493,24 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
             draft_token_ids = None
             if decode_data is not None:
-                draft_token_ids, hidden_states = self.propose_eagle_decode(
-                    sampled_token_ids,
-                    decode_sampled_token_ids_tensor,
-                    hidden_states,
-                    aux_hidden_states,
-                    num_decodes,
-                    decode_data,
-                )
+                if decode_data.spec_decode_metadata is None:
+                    draft_token_ids, hidden_states = self.propose_eagle_decode_no_spec(
+                        sampled_token_ids,
+                        decode_sampled_token_ids_tensor,
+                        hidden_states,
+                        aux_hidden_states,
+                        num_decodes,
+                        decode_data,
+                    )
+                else:
+                    draft_token_ids, hidden_states = self.propose_eagle_decode(
+                        sampled_token_ids,
+                        decode_sampled_token_ids_tensor,
+                        hidden_states,
+                        aux_hidden_states,
+                        num_decodes,
+                        decode_data,
+                    )
             # handle prefill
             if prefill_data is not None:
                 # Currently, prefill is done one by one
@@ -4568,6 +4581,45 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.drafter.model.compute_logits(sample_hidden_states)
         draft_token_ids = logits.argmax(dim=-1)
+        return draft_token_ids, hidden_states
+
+    def propose_eagle_decode_no_spec(
+            self,
+            sampled_token_ids: list[list[int]],
+            decode_sampled_token_ids_tensor: torch.Tensor,
+            hidden_states: torch.Tensor,
+            aux_hidden_states: Optional[torch.Tensor],
+            num_decodes: int,
+            decode_data: Optional[DecodeInputData],
+    ):
+        common_attn_metadata = decode_data.attn_metadata
+        token_ids = decode_data.token_ids
+        position_ids = decode_data.position_ids
+        logits_indices = decode_data.logits_indices
+        next_token_ids = decode_sampled_token_ids_tensor
+
+        # Follow GPU to shift input_tokens by one to the left
+        # to match hidden_states
+        token_ids = token_ids.squeeze()
+        target_token_ids = token_ids.clone()
+        target_token_ids[:-1].copy_(token_ids[1:])
+        target_token_ids[logits_indices] = next_token_ids
+        target_token_ids = target_token_ids.reshape(-1, 1)
+
+        if self.use_aux_hidden_state_outputs and \
+                aux_hidden_states is not None:
+            target_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+        else:
+            target_hidden_states = hidden_states
+
+        if target_hidden_states.dim() == 2:
+            target_hidden_states = target_hidden_states.unsqueeze(1)
+        draft_token_ids, hidden_states = self.propose_eagle_draft_token_ids(
+            target_token_ids, position_ids,
+            target_hidden_states, logits_indices,
+            common_attn_metadata)
+
+        draft_token_ids = draft_token_ids[:num_decodes]
         return draft_token_ids, hidden_states
 
     def propose_eagle_decode(
