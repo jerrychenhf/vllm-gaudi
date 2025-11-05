@@ -3318,7 +3318,9 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         for req_id in self.input_batch.req_ids[:num_reqs]:
             req_state = self.requests[req_id]
             i = self.input_batch.req_id_to_index[req_id]
-            seq_len = (req_state.num_computed_tokens + scheduler_output.num_scheduled_tokens[req_id])
+            # cannot use num_computed_tokens + num_scheduled_tokens here
+            # as it may include rejected spec decode tokens
+            seq_len = self.input_batch.num_tokens_no_spec[i]
             token_ids = postprocessed_sampled_token_ids[i]
             num_tokens = len(token_ids)
             self.input_batch.token_ids_cpu[i, seq_len:seq_len + num_tokens] = token_ids
@@ -3781,8 +3783,25 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                            total_tokens,
                            scheduled_tokens,
                            is_prompt,
-                           block_id=0):
-        num_blocks = round_up(total_tokens, self.block_size) // self.block_size
+                           block_id=0,
+                           scheduled_spec_decode_tokens=None):
+        # Spec decode: blocks should include spec tokens
+        # and look ahead tokens (eagle)
+        total_tokens_for_blocks = total_tokens
+        if (scheduled_spec_decode_tokens is not None and not is_prompt and
+                self.speculative_config):
+            # consider num_speculative_tokens as spec decode tokens
+            num_speculative_tokens = \
+                self.speculative_config.num_speculative_tokens
+            total_tokens_for_blocks += num_speculative_tokens
+            if self.speculative_config.use_eagle():
+                total_tokens_for_blocks += num_speculative_tokens
+            # check the limit of the max model length
+            if total_tokens_for_blocks > self.max_model_len:
+                total_tokens_for_blocks = self.max_model_len
+
+        num_blocks = round_up(
+            total_tokens_for_blocks, self.block_size) // self.block_size
         prompt_token_ids = list(range(total_tokens))
 
         req_id = f'{len(requests)}'
@@ -3804,6 +3823,12 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             num_scheduled_tokens[req_id] = len(prompt_token_ids) - num_computed_tokens
         else:
             num_scheduled_tokens[req_id] = scheduled_tokens
+            if (scheduled_spec_decode_tokens is not None and
+                    self.speculative_config):
+                num_spec_tokens = self.speculative_config.num_speculative_tokens
+                num_scheduled_tokens[req_id] += num_spec_tokens
+                scheduled_spec_decode_tokens[req_id] = list(
+                    range(num_spec_tokens))
 
     def _add_dummy_unified_request(self, requests, is_prompt, is_unique, block_num, num_computed_tokens,
                                    num_scheduled_tokens, scheduled_tokens):
@@ -3835,14 +3860,20 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         requests.append(req)
         scheduled_tokens[req_id] = num_scheduled_tokens
 
-    @staticmethod
-    def _generate_seq_lengths(num_samples, num_blocks, block_size):
+    def _generate_seq_lengths(self, num_samples, num_blocks, block_size):
         assert num_samples <= num_blocks
         blocks = [num_blocks // num_samples] * num_samples
         missing_blocks = num_blocks - sum(blocks)
         for i in range(missing_blocks):
             blocks[i] += 1
-        seq_lengths = [b * block_size - 1 for b in blocks]
+
+        # leave token space for scheduled output token and new output token
+        num_future_tokens = 2
+        if self.speculative_config:
+            num_future_tokens += (
+                self.speculative_config.num_speculative_tokens)
+
+        seq_lengths = [b * block_size - num_future_tokens for b in blocks]
         return seq_lengths
 
     def distribute_sum_evenly(self, total_sum, max_length):
@@ -3963,6 +3994,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
     def _prepare_dummy_scenario(self, prompt_cfg, decode_cfg):
         requests: list[NewRequestData] = []
         scheduled_tokens: dict[str, int] = {}
+        scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
         if prompt_cfg:
             prompt_bs, prompt_query_len, prompt_num_blocks = prompt_cfg
@@ -3992,24 +4024,30 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                 decode_seq_lengths = self._generate_seq_lengths(decode_bs, decode_num_blocks, self.block_size)
                 block_id = 0
             for dsl in decode_seq_lengths:
-                self._add_dummy_request(requests,
-                                        scheduled_tokens,
-                                        num_computed_tokens=dsl,
-                                        total_tokens=dsl,
-                                        scheduled_tokens=1,
-                                        is_prompt=False,
-                                        block_id=block_id)
-        self._execute_dummy_scenario(requests, scheduled_tokens)
+                self._add_dummy_request(
+                    requests,
+                    scheduled_tokens,
+                    num_computed_tokens=dsl,
+                    total_tokens=dsl,
+                    scheduled_tokens=1,
+                    is_prompt=False,
+                    block_id=block_id,
+                    scheduled_spec_decode_tokens=scheduled_spec_decode_tokens)
+        self._execute_dummy_scenario(requests, scheduled_tokens,
+                                     scheduled_spec_decode_tokens)
 
-    def _execute_dummy_scenario(self, requests, scheduled_tokens):
+    def _execute_dummy_scenario(self, requests, scheduled_tokens,
+                                scheduled_spec_decode_tokens=None):
         from vllm.v1.core.sched.output import (SchedulerOutput, CachedRequestData)
 
+        if scheduled_spec_decode_tokens is None:
+            scheduled_spec_decode_tokens = {}
         sched_output = SchedulerOutput(
             scheduled_new_reqs=requests,
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens=scheduled_tokens,
             total_num_scheduled_tokens=sum(scheduled_tokens.values()),
-            scheduled_spec_decode_tokens={},
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=0,
             finished_req_ids=set(),
