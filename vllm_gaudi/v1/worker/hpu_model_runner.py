@@ -810,9 +810,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         # NOTE(Chendi): Speculative decoding is only enabled for the last rank
         # in the pipeline parallel group.
         if self.speculative_config:
-            if self.speculative_config.num_speculative_tokens > 1:
-                raise NotImplementedError("Speculative decoding with num_speculative_tokens > 1 is "
-                                          "not supported on HPU.")
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.use_eagle():
@@ -4574,7 +4571,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
         if target_hidden_states.dim() == 2:
             target_hidden_states = target_hidden_states.unsqueeze(1)
-        draft_token_ids, hidden_states = self.propose_eagle_draft_token_ids(
+        draft_token_ids, hidden_states = self.drafter.propose_draft_token_ids(
             target_token_ids, position_ids,
             target_hidden_states, logits_indices,
             common_attn_metadata)

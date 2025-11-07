@@ -8,16 +8,24 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 class HpuEagleProposer (EagleProposer):
     def propose_draft_token_ids(
         self,
+        # [virtual_batch_size, seq_len]
         target_token_ids,
+        # [virtual_batch_size, seq_len]
         target_positions,
+        # [virtual_batch_size, seq_len, hidden_size]
         target_hidden_states,
         last_token_indices,
         common_attn_metadata,
     ):
-        num_tokens = target_token_ids.shape[0]
+        # For decode, the virtual batch_size is real batch size * num_tokens
+        # and the seq_len is always 1
         batch_size = last_token_indices.shape[0]
+        virtual_batch_size = target_token_ids.shape[0]
+        seq_len = target_token_ids.shape[-1]
+        num_tokens = virtual_batch_size * seq_len
+        hidden_size = target_hidden_states.shape[-1]
 
-        if self.drafter.method == "eagle3":
+        if self.method == "eagle3":
             assert isinstance(self.model.model, Eagle3LlamaForCausalLM)
             target_hidden_states = \
                 self.model.model.combine_hidden_states(
@@ -25,8 +33,9 @@ class HpuEagleProposer (EagleProposer):
             assert target_hidden_states.shape[-1] == self.hidden_size
 
         # copy inputs to buffer
-        self._set_positions(num_tokens, target_positions)
-        self.hidden_states[:num_tokens] = target_hidden_states
+        self._set_positions(num_tokens, target_positions.view(-1))
+        self.hidden_states[:num_tokens] = target_hidden_states.view(-1,
+                                                                    hidden_size)
 
         ret_hidden_states = self.model(
             input_ids=target_token_ids,
@@ -57,9 +66,11 @@ class HpuEagleProposer (EagleProposer):
         else:
             positions = target_positions[last_token_indices]
         if self.method in ("deepseek_mtp", "ernie_mtp", "longcat_flash_mtp"):
-            hidden_states = self.hidden_states[last_token_indices]
+            hidden_states = self.hidden_states.view(
+                -1, self.hidden_states.shape[-1])
         else:
-            hidden_states = hidden_states[last_token_indices]
+            hidden_states = hidden_states.view(-1, last_hidden_states.shape[-1])
+        hidden_states = hidden_states[last_token_indices]
 
         # The first draft tokens
         draft_token_ids = logits.argmax(dim=-1)
