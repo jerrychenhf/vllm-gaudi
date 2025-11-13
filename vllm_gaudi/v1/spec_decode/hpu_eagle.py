@@ -28,10 +28,6 @@ class HpuEagleProposer(EagleProposer):
         # For decode, the virtual batch_size is batch size * num_tokens
         # and the seq_len is always 1
         batch_size = last_token_indices.shape[0]
-        virtual_batch_size = target_token_ids.shape[0]
-        seq_len = target_token_ids.shape[-1]
-        hidden_size = target_hidden_states.shape[-1]
-        num_tokens = virtual_batch_size * seq_len
 
         if self.method == "eagle3":
             assert isinstance(self.model.model, Eagle3LlamaForCausalLM)
@@ -39,10 +35,6 @@ class HpuEagleProposer(EagleProposer):
                 self.model.model.combine_hidden_states(
                     target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
-
-        # copy inputs to buffer
-        self._set_positions(num_tokens, target_positions.view(-1))
-        self.hidden_states[:num_tokens] = target_hidden_states.view(-1, hidden_size)
 
         ret_hidden_states = self.model(
             input_ids=target_token_ids,
@@ -71,9 +63,9 @@ class HpuEagleProposer(EagleProposer):
         # [batch_size]
         positions = target_positions[last_token_indices]
         if self.method in ("deepseek_mtp", "ernie_mtp", "longcat_flash_mtp"):
-            hidden_states = self.hidden_states.view(-1, self.hidden_states.shape[-1])
+            hidden_states = target_hidden_states.view(-1, target_hidden_states.shape[-1])
         else:
-            hidden_states = hidden_states.view(-1, last_hidden_states.shape[-1])
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
         # [batch_size, hidden_size]
         hidden_states = hidden_states[last_token_indices]
@@ -82,8 +74,6 @@ class HpuEagleProposer(EagleProposer):
         draft_token_ids = logits.argmax(dim=-1)
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
-        # May include batch size padding (in our case, we are the same)
-        input_batch_size = batch_size
 
         # Decode 1 token each time
         for token_index in range(self.num_speculative_tokens - 1):
@@ -101,17 +91,12 @@ class HpuEagleProposer(EagleProposer):
             attn_metadata = self.prepare_attn_metadata(
                 block_table_cpu_tensor, positions, clamped_positions, model_runner)
 
-            # Copy inputs to buffer
-            self.input_ids[:batch_size] = input_ids
-            self._set_positions(batch_size, clamped_positions)
-            self.hidden_states[:batch_size] = hidden_states
-
             # [batch_size, 1]
-            input_ids = self.input_ids[:input_batch_size].view(-1, 1)
+            input_ids = input_ids.view(-1, 1)
             # [batch_size, 1]
-            input_positions = self._get_positions(input_batch_size).view(-1, 1)
+            input_positions = clamped_positions.view(-1, 1)
             # [batch_size, 1, hidden_size]
-            input_hidden_states = self.hidden_states[:input_batch_size].view(-1, 1, hidden_size)
+            input_hidden_states = hidden_states.view(-1, 1, hidden_states.shape[-1])
             inputs_embeds = None
 
             ret_hidden_states = self.model(
