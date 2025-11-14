@@ -3202,6 +3202,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
                     if spec_decode_metadata is None:
                         decode_sampled_token_ids.append(sampler_output.sampled_token_ids.flatten())
+                        decode_sampled_token_ids_device = sampler_output.sampled_token_ids.to("hpu", non_blocking=True)
                     else:
                         # Handling spec decode sampling.
                         sampler_output = self.rejection_sampler(
@@ -4549,10 +4550,10 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
             draft_token_ids = None
             if decode_data is not None:
-                assert decode_data.spec_decode_metadata is not None
                 assert decode_data.position_ids is not None
-                num_draft_tokens = \
-                    decode_data.spec_decode_metadata.num_draft_tokens
+                # if there is no spec decode tokens consider num_draft_tokens all 0
+                num_draft_tokens = ([0] * len(sampled_token_ids) if decode_data.spec_decode_metadata is None
+                                    else decode_data.spec_decode_metadata.num_draft_tokens)
                 max_num_draft_tokens = max(num_draft_tokens)
                 common_attn_metadata = decode_data.attn_metadata
 
